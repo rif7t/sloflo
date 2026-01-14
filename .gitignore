@@ -1,0 +1,28 @@
+# Go build outputs
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# eBPF compiled objects
+*_bpfel.o
+*_bpfeb.o
+*_bpfel.go
+*_bpfeb.go
+*.o
+
+# Editor/IDE files
+*.swp
+*.swo
+*.swn
+*.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
+
+# CSV 
+*.csv
