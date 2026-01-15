@@ -19,31 +19,20 @@ import (
 	"github.com/cilium/ebpf/ringbuf"
 )
 
-type Latency struct {
-	LatencyNs uint64
-	Pid       uint32
-	Tid       uint32
-	Layer     uint8
-}
 type ControlState struct {
 	MinRTTNs         uint64
 	ConcurrencyLimit uint32
 	Inflight         uint32
 	LatestRTTNs      uint64
-	LastProgressNs   uint64
-	Active           uint8
-	_                [7]byte
 }
 
 const (
-	MinConcurrency     = 5
-	MaxConcurrency     = 40
-	InitialConcurrency = 10
+	MinConcurrency     = 30
+	MaxConcurrency     = 150
+	InitialConcurrency = 50
 )
 
 func main() {
-	// Load pinned ringbuffer map
-
 	var objs rlimitObjects
 	err := loadRlimitObjects(&objs, nil)
 	if err != nil {
@@ -59,6 +48,13 @@ func main() {
 	if err := objs.ControlMap.Update(&zero, &initial, 0); err != nil {
 		log.Fatalf("init control_map failed: %v", err)
 	}
+
+	// Verify initialization
+	var verifyState ControlState
+	if err := objs.ControlMap.Lookup(&zero, &verifyState); err != nil {
+		log.Fatalf("verify control_map failed: %v", err)
+	}
+	fmt.Printf("ControlMap initialized: inflight=%d, concurrency_limit=%d\n", verifyState.Inflight, verifyState.ConcurrencyLimit)
 
 	reader, err := ringbuf.NewReader(objs.LatencyEvents)
 	if err != nil {
@@ -96,23 +92,20 @@ func main() {
 	}
 	defer xdp_rate_limiter_link.Close()
 
-	tcp_rcv_established_link, err := link.Kprobe("tcp_rcv_established", objs.KprobeTcpRcvEstablished, nil)
+	tcp_rcv_established_link, err := link.AttachTracing(link.TracingOptions{
+		Program: objs.FentryTcpRcvEstablished,
+	})
 	if err != nil {
 		log.Fatalf("load tcp_rcv_established kprobe: %v", err)
 	}
 	defer tcp_rcv_established_link.Close()
 
-	tcp_close_link, err := link.Kprobe("tcp_close", objs.KprobeTcpClose, nil)
+	inet_csk_accept_link, err := link.Tracepoint("sock", "inet_sock_set_state", objs.TraceInetSockSetState, nil)
 	if err != nil {
-		log.Fatalf("load tcp_close  %v", err)
+		log.Fatalf("load inet_sock_set_state tracepoint: %v", err)
 	}
-	defer tcp_close_link.Close()
+	defer inet_csk_accept_link.Close()
 
-	tcp_sendmsgProg, err := link.Kretprobe("tcp_sendmsg", objs.KretprobeTcpSendmsg, nil)
-	if err != nil {
-		log.Fatalf("load tcp_sendmsg kretprobe: %v", err)
-	}
-	defer tcp_sendmsgProg.Close()
 	fmt.Println("Listening for packet events...")
 
 	f, err := os.Create("rlimit_results.csv")
@@ -173,12 +166,12 @@ func main() {
 			gradient := float64(state.MinRTTNs) / float64(rtt)
 
 			switch {
-			case gradient > 0.90:
+			case gradient > 0.95:
 				state.ConcurrencyLimit++
-			case gradient < 0.75:
+			case gradient < 0.70:
 				if state.ConcurrencyLimit > 1 {
 					var limit = state.ConcurrencyLimit
-					state.ConcurrencyLimit = limit * 7 / 10
+					state.ConcurrencyLimit = limit * 6 / 10
 				}
 			}
 
@@ -201,8 +194,9 @@ func main() {
 
 			err = objs.ControlMap.Update(&key, &state, 0)
 			if err != nil {
-				log.Fatalf("update control_state failed: %v", err)
+				log.Fatalf("update control_map failed: %v", err)
 			}
+
 			fmt.Printf("LatestRTT: %d ns, Gradient: %.5f, MinRTT: %d, Inflight: %d, New Concurrency Limit: %d\n", rtt, gradient, state.MinRTTNs, state.Inflight, state.ConcurrencyLimit)
 		}
 	}
