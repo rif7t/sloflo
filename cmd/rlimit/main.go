@@ -27,9 +27,9 @@ type ControlState struct {
 }
 
 const (
-	MinConcurrency     = 30
-	MaxConcurrency     = 150
-	InitialConcurrency = 50
+	MinConcurrency     = 0
+	MaxConcurrency     = 250
+	InitialConcurrency = 0
 )
 
 func main() {
@@ -41,20 +41,11 @@ func main() {
 	defer objs.Close()
 
 	var zero uint32 = 0
-	initial := ControlState{
-		ConcurrencyLimit: InitialConcurrency,
-	}
+	var initial uint64 = 0
 
-	if err := objs.ControlMap.Update(&zero, &initial, 0); err != nil {
+	if err := objs.InflightTotal.Update(&zero, &initial, 0); err != nil {
 		log.Fatalf("init control_map failed: %v", err)
 	}
-
-	// Verify initialization
-	var verifyState ControlState
-	if err := objs.ControlMap.Lookup(&zero, &verifyState); err != nil {
-		log.Fatalf("verify control_map failed: %v", err)
-	}
-	fmt.Printf("ControlMap initialized: inflight=%d, concurrency_limit=%d\n", verifyState.Inflight, verifyState.ConcurrencyLimit)
 
 	reader, err := ringbuf.NewReader(objs.LatencyEvents)
 	if err != nil {
@@ -100,11 +91,13 @@ func main() {
 	}
 	defer tcp_rcv_established_link.Close()
 
-	inet_csk_accept_link, err := link.Tracepoint("sock", "inet_sock_set_state", objs.TraceInetSockSetState, nil)
+	tcp_set_state_link, err := link.AttachTracing(link.TracingOptions{
+		Program: objs.FentryTcpSetState,
+	})
 	if err != nil {
-		log.Fatalf("load inet_sock_set_state tracepoint: %v", err)
+		log.Fatalf("load tcp set state kprobe: %v", err)
 	}
-	defer inet_csk_accept_link.Close()
+	defer tcp_set_state_link.Close()
 
 	fmt.Println("Listening for packet events...")
 
@@ -165,39 +158,30 @@ func main() {
 
 			gradient := float64(state.MinRTTNs) / float64(rtt)
 
-			switch {
-			case gradient > 0.95:
-				state.ConcurrencyLimit++
-			case gradient < 0.70:
-				if state.ConcurrencyLimit > 1 {
-					var limit = state.ConcurrencyLimit
-					state.ConcurrencyLimit = limit * 6 / 10
-				}
-			}
-
-			if state.ConcurrencyLimit < MinConcurrency {
-				state.ConcurrencyLimit = MinConcurrency
-			} else if state.ConcurrencyLimit > MaxConcurrency {
-				state.ConcurrencyLimit = MaxConcurrency
-			}
-
-			writer.Write([]string{
-				fmt.Sprintf("%d", time.Now().UnixNano()),
-				fmt.Sprintf("%d", rtt),
-				fmt.Sprintf("%.5f", gradient),
-				fmt.Sprintf("%d", state.MinRTTNs),
-				fmt.Sprintf("%d", state.Inflight),
-				fmt.Sprintf("%d", state.ConcurrencyLimit),
-			})
-			writer.Flush()
 			state.LatestRTTNs = rtt
 
 			err = objs.ControlMap.Update(&key, &state, 0)
 			if err != nil {
 				log.Fatalf("update control_map failed: %v", err)
 			}
+			var zero uint32
+			var inflight_total uint64
+			err = objs.InflightTotal.Lookup(&zero, &inflight_total)
+			if err != nil {
+				log.Fatalf("error reading total inflight: %v", err)
+			}
 
-			fmt.Printf("LatestRTT: %d ns, Gradient: %.5f, MinRTT: %d, Inflight: %d, New Concurrency Limit: %d\n", rtt, gradient, state.MinRTTNs, state.Inflight, state.ConcurrencyLimit)
+			state.ConcurrencyLimit = uint32(uint64(float64(state.ConcurrencyLimit)*gradient) + inflight_total)
+			writer.Write([]string{
+				fmt.Sprintf("%d", time.Now().UnixNano()),
+				fmt.Sprintf("%d", rtt),
+				fmt.Sprintf("%.5f", gradient),
+				fmt.Sprintf("%d", state.MinRTTNs),
+				fmt.Sprintf("%d", inflight_total),
+				fmt.Sprintf("%d", state.ConcurrencyLimit),
+			})
+			writer.Flush()
+			fmt.Printf("LatestRTT: %d ns, Gradient: %.5f, MinRTT: %d, Inflight: %d, New Concurrency Limit: %d\n", rtt, gradient, state.MinRTTNs, inflight_total, state.ConcurrencyLimit)
 		}
 	}
 
