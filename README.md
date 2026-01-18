@@ -29,7 +29,11 @@ When the system observes a decrease in latency (RTT), the algorithm increases th
 
 Sloflo is moving toward **Service Level Objective (SLO)** integration. This will allow users to define specific latency targets (e.g., p95 < 50ms). The engine will then manage the concurrency limit specifically to stay within those business-defined bounds, balancing high hardware utilization with predictable performance.
 
+## Analysis & Performance
 
+The effectiveness of the concurrency control can be observed in the system metrics. As seen in the performance graph below, the **Inflight** requests strictly follow the **Concurrency Limit** baseline.
+
+![Sloflo Performance Profile](./plots/analysis_unified_rtt_inflight_limit.png)
 
 ## License
 
