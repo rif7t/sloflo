@@ -33,7 +33,7 @@ Sloflo is moving toward **Service Level Objective (SLO)** integration. This will
 
 The effectiveness of the concurrency control can be observed in the system metrics. As seen in the performance graph below, the **Inflight** requests strictly follow the **Concurrency Limit** baseline.
 
-![Sloflo Performance Profile](./plots/analysis_unified_rtt_inflight_limit.png)
+![Sloflo Performance Profile](./plots/analysis_unified_rtt_inflight_limit.png.png)
 
 ## License
 
