@@ -25,12 +25,6 @@ The effectiveness of the concurrency control can be observed in the system metri
 
 When the system observes a decrease in latency (RTT), the algorithm increases the concurrency limit, allowing more inflight packets into the system. Conversely, as latency spikes, the gradient drops, and Sloflo immediately "clenches" the limit to protect the application from bufferbloat and resource exhaustion.
 
-## Technical Advantages
-
-* **Early Load Shedding:** By dropping packets at the XDP layer, the system avoids spending CPU cycles on TCP/IP parsing, memory allocation, or context switching for requests that cannot be serviced.
-* **Congestion Avoidance:** Rather than reacting to a full buffer, Sloflo reacts to the *speed* of processing, allowing it to mitigate queuing latency before it impacts the entire stack.
-* **Self-Tuning:** The engine discovers the physical capacity of the underlying hardware and application stack automatically, requiring no manual threshold configuration.
-
 ## Future Direction
 
 Sloflo is moving toward **Service Level Objective (SLO)** integration. This will allow users to define specific latency targets (e.g., p95 < 50ms). The engine will then manage the concurrency limit specifically to stay within those business-defined bounds, balancing high hardware utilization with predictable performance.
