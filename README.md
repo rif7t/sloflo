@@ -27,7 +27,7 @@ When the system observes a decrease in latency (RTT), the algorithm increases th
 
 ## Future Direction
 
-Sloflo is moving toward **Service Level Objective (SLO)** integration. This will allow users to define specific latency targets (e.g., p95 < 50ms). The engine will then manage the concurrency limit specifically to stay within those business-defined bounds, balancing high hardware utilization with predictable performance.
+Sloflo is moving toward **Service Level Objective (SLO)** integration. This will allow users to define specific latency targets (e.g., p95 < 50ms). The engine will then manage the concurrency limit specifically to stay within those business-defined bounds.
 
 ## Analysis & Performance
 
