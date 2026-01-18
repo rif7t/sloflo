@@ -3,6 +3,7 @@ package main
 //go:generate go tool bpf2go -tags linux rlimit ../../ebpf/rlimit.c
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"encoding/csv"
@@ -12,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -68,7 +70,19 @@ func main() {
 		}
 	}()
 
-	iface, err := net.InterfaceByName("wlp0s20f3")
+	ifsource, _ := os.Open("/proc/net/route")
+	defer ifsource.Close()
+
+	scanner := bufio.NewScanner(ifsource)
+	scanner.Scan()
+	var ifname string
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if fields[1] == "00000000" {
+			ifname = fields[0]
+		}
+	}
+	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
 		log.Fatalf("interface not found: %v", err)
 	}
