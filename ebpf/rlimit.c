@@ -4,208 +4,194 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 
-#define STALL_NS (5ULL * 1000 * 1000 * 1000) // 5 seconds
+#define TCP_NEW_SYN_RECV 11
+#define TCP_ESTABLISHED 1
+#define TCP_LAST_ACK 8
+#define TCP_CLOSE_WAIT 7
+#define SERVER_PID 278040
+#define TARGET_PORT 8080
 
-
-struct sock_state{
-    __u64 last_progress_ns;
-    __u8 active;
+struct control_state {
+	u64 min_rtt_ns;
+	u32 concurrency_limit;
+	u32 inflight;
+	u64 latest_rtt_ns;
 };
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
-    __type(key, __u64);              
-    __type(value, struct sock_state);
-} sock_states SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, __s64);
-} active_count SEC(".maps");
-
-struct control_state{
-    u64 min_rtt_ns;
-    u32 concurrency_limit;
-    u32 inflight;
-    u64 latest_rtt_ns;
-    u64 last_progress_ns;
-    u8 active;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 65536);
-    __type(key, struct sock *);
-    __type(value, struct control_state);
-} sock_to_cs SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, u32);
-    __type(value, struct control_state);
-    __uint(max_entries, 1);
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__type(key, u32);
+	__type(value, struct control_state);
+	__uint(max_entries, 1);
 } control_map SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 1 << 12);
-} latency_events SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct sock*);
+    __type(value, u64);
+} sock_inflight SEC(".maps");
 
 struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, u32);  
-    __type(value, u32); 
-} xdp_rate_limit_map SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, u32);
+    __type(value, u64);
+} inflight_total SEC(".maps");
 
-static __always_inline u64 pid_tid_key(u32 pid, u32 tid) {
-    return ((u64)pid << 32) | tid;
-}
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 1 << 12);
+} latency_events SEC(".maps");
 
-static __always_inline void decay_if_stalled(struct control_state *cs, __u64 now)
+static __always_inline unsigned int tcp_left_out(const struct tcp_sock *tp)
 {
-    if(!cs || !cs->active)
-        return;
-    
-     if (now - cs->last_progress_ns > STALL_NS) { 
-        if (cs->inflight > 0)
-            __sync_fetch_and_add(&cs->inflight, -1);
-
-        cs->active = 0;
-    }
+    u32 sacked = BPF_CORE_READ(tp, sacked_out);
+    u32 lost   = BPF_CORE_READ(tp, lost_out);
+    return sacked + lost;
 }
 
-static __always_inline void mark_active(struct control_state *cs, __u64 now)
+static __always_inline unsigned int tcp_packets_in_flight(const struct tcp_sock *tp)
 {
-   if (!cs)
-        return;
-    decay_if_stalled(cs, now);
-
-    if (!cs->active) {
-        __sync_fetch_and_add(&cs->inflight, 1);
-        cs->active = 1;
-    }
-
-    cs->last_progress_ns = now;
+    u32 packets_out  = BPF_CORE_READ(tp, packets_out);
+    u32 retrans_out  = BPF_CORE_READ(tp, retrans_out);
+    return packets_out - tcp_left_out(tp) + retrans_out;
 }
 
-// SEC("kprobe/tcp_rcv_established")
-// int BPF_PROG(kprobe_tcp_rcv_established, struct sock *sk, struct sk_buff *skb) {
-// struct control_state *cs = bpf_map_lookup_elem(&sock_to_cs, &sk);
-//     if (!cs)
-//         return 0;
+SEC("fentry/tcp_ack")
+int BPF_PROG(fentry_tcp_ack, struct sock *sk, const struct sk_buff * skb, int flag)
+{
 
-//     mark_active(cs, bpf_ktime_get_ns());
+    struct tcp_sock *ts = (struct tcp_sock *)(sk);
+    u64 cur = tcp_packets_in_flight(ts);
+    u64 *prev = bpf_map_lookup_elem(&sock_inflight, &sk);
 
-//     u64 rtt;
-//     struct tcp_sock *ts = (struct tcp_sock *)(sk);
-//     rtt = BPF_CORE_READ(ts, srtt_us) >> 3;
-//     rtt *= 1000;
-//     if(rtt == 0)
-//         return 0;
-//     u64 *evt = bpf_ringbuf_reserve(&latency_events, sizeof(*evt), 0);
-//     if(!evt)
-//         return 0;
-//     if(evt){
-//         *evt = rtt;
-//         bpf_printk("rtt event: %d", rtt);
-//         bpf_ringbuf_submit(evt, 0);
-//     }    
-   
-//     return 0;
-// }
+    s32 delta;
+    if (prev) {
+        delta = (s32)cur - (s32)(*prev);
+        *prev = cur;
+    }else {
+        bpf_map_update_elem(&sock_inflight, &sk, &cur, BPF_ANY);
+        delta = cur;
+    }
+    if (delta < 0) {
+        bpf_printk("Delta < 0: %d", delta);
+        u32 zero = 0;
+        u64 *total = bpf_map_lookup_elem(&inflight_total, &zero);
+        u64 oldtotal = *total ;
+        if (total){
+            bpf_printk("Total inflights pre sub: %llu", oldtotal);
+            __sync_fetch_and_sub(total, -delta);
 
-SEC("kprobe/tcp_rcv_established")
-int BPF_PROG(kprobe_tcp_rcv_established, struct sock *sk, struct sk_buff *skb) {
-struct control_state *cs = bpf_map_lookup_elem(&sock_to_cs, &sk);
-    if (!cs)
+            u64 *newTotal = bpf_map_lookup_elem(&inflight_total, &zero);
+            u64 newtotal = *newTotal;
+            if(newTotal)
+                bpf_printk("Total inflights post sub: %llu", *newTotal);
+        }
+    }
+    return 0;
+}
+
+SEC("fentry/tcp_rcv_established")
+int BPF_PROG(fentry_tcp_rcv_established, struct sock *sk) {
+    u64 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != SERVER_PID){
         return 0;
-
-    mark_active(cs, bpf_ktime_get_ns());
-
+    }
+    u16 sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+    if (sport != TARGET_PORT)
+        return 0;
     u64 rtt;
     struct tcp_sock *ts = (struct tcp_sock *)(sk);
-    rtt = BPF_CORE_READ(ts, srtt_us) >> 3;
-    rtt *= 1000;
-    if(rtt == 0)
-        return 0;
-    u64 *evt = bpf_ringbuf_reserve(&latency_events, sizeof(*evt), 0);
-    if(!evt)
-        return 0;
-    if(evt){
-        *evt = rtt;
-        bpf_printk("rtt event: %d", rtt);
-        bpf_ringbuf_submit(evt, 0);
-    }
-   
-    return 0;
-}
-
-SEC("kretprobe/tcp_sendmsg")
-int BPF_PROG(kretprobe_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size, int ret) {
-    struct control_state *cs = bpf_map_lookup_elem(&sock_to_cs, &sk);
-
-    if (!cs) {
-        struct control_state init = {
-            .concurrency_limit = 10, 
-            .inflight = 0,
-            .active = 0,
-        };
-        bpf_map_update_elem(&sock_to_cs, &sk, &init, BPF_NOEXIST);
-
-        cs = bpf_map_lookup_elem(&sock_to_cs, &sk);
-        if (!cs)
+    u64 cur = tcp_packets_in_flight(ts);
+    u64 *prev = bpf_map_lookup_elem(&sock_inflight, &sk);
+    s32 delta;
+    
+    if(prev){
+        if(cur == *prev)
             return 0;
+        delta = (s32)cur - (s32)(*prev);
+        *prev = cur;
+    }else{
+        bpf_map_update_elem(&sock_inflight, &sk, &cur, BPF_ANY);
+        delta = cur;
     }
-
-    mark_active(cs, bpf_ktime_get_ns());
-    return 0;
-}
-
-
-// SEC("kprobe/tcp_retransmit_skb")
-// int BPF_PROG(kprobe_tcp_retransmit_skb, struct sock *sk, struct sk_buff *skb)
-// {
-//    struct control_state *cs = bpf_map_lookup_elem(&sock_to_cs, &sk);
-//     if (!cs)
-//         return 0;
-
-//     decay_if_stalled(cs, bpf_ktime_get_ns());
-//     return 0;
-// }
-
-SEC("kprobe/tcp_close")
-int BPF_PROG(kprobe_tcp_close, struct sock *sk)
-{
-    struct control_state *cs;
-
-    cs = bpf_map_lookup_elem(&sock_to_cs, &sk);
-    if (!cs)
+    u32 zero = 0;
+    u64 *total = bpf_map_lookup_elem(&inflight_total, &zero);
+    if(total){
+        if (delta > 0)
+            __sync_fetch_and_add(total, delta);
+        else if (delta < 0){
+            __sync_fetch_and_sub(total, -delta);
+        }
+            
+    }
+    rtt = BPF_CORE_READ(ts, srtt_us) >> 3;
+    rtt *= 1000;    
+    if (rtt == 0)
         return 0;
-
-    if (cs->active){
-        if (cs->inflight > 0)
-    __sync_fetch_and_add(&cs->inflight, -1);
-
-    }
-
-    bpf_map_delete_elem(&sock_to_cs, &sk);
+    
+    u64 *evt = bpf_ringbuf_reserve(&latency_events, sizeof(*evt), 0);
+    if (!evt)
+        return 0;
+    
+    *evt = rtt;
+    bpf_ringbuf_submit(evt, 0);
+    
     return 0;
 }
+
+SEC("fentry/tcp_set_state")
+int BPF_PROG(fentry_tcp_set_state, struct sock *sk, int state)
+{
+    u64 pid = bpf_get_current_pid_tgid() >> 32;
+    if (pid != SERVER_PID){
+        return 0;
+    }
+    u16 sport = BPF_CORE_READ(sk, __sk_common.skc_num);
+    if (sport != TARGET_PORT)
+        return 0;
+    u64 rtt;
+    struct tcp_sock *ts = (struct tcp_sock *)(sk);
+    u64 cur = tcp_packets_in_flight(ts);
+    u64 *prev = bpf_map_lookup_elem(&sock_inflight, &sk);
+    s32 delta;
+    
+    if(prev){
+        if(cur == *prev)
+            return 0;
+        delta = (s32)cur - (s32)(*prev);
+        *prev = cur;
+    }else{
+        bpf_map_update_elem(&sock_inflight, &sk, &cur, BPF_ANY);
+        delta = cur;
+    }
+    u32 zero = 0;
+    u64 *total = bpf_map_lookup_elem(&inflight_total, &zero);
+    if(total){
+        if (delta > 0)
+            __sync_fetch_and_add(total, delta);
+        else if (delta < 0){
+            __sync_fetch_and_sub(total, -delta);
+        }
+            
+    }
+    return 0;
+}
+
 
 SEC("xdp")
 int xdp_rate_limiter(struct xdp_md *ctx) {
     u32 zero = 0;
     struct control_state *cs = bpf_map_lookup_elem(&control_map, &zero);
-    if(!cs) 
+    if (!cs)
         return XDP_PASS;
-    if(cs->inflight >= cs->concurrency_limit){
-        bpf_printk("DROPPED");
-        //return XDP_DROP;
+    
+    if (cs->inflight > cs->concurrency_limit) {
+        bpf_printk("DROPPED: inflight=%d, limit=%d", cs->inflight, cs->concurrency_limit);
+        return XDP_DROP;
     }
+    
     return XDP_PASS;
 }
 
