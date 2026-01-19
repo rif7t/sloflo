@@ -32,10 +32,6 @@ In high-load environments, Sloflo demonstrates rapid convergence. Recent perform
 
 The **Inflight** requests strictly follow the **Concurrency Limit** ceiling. When the backend "Drain Rate" slows down, Sloflo instantly closes the gate, allowing the application to clear its backlog before reopening for more traffic.
 
-## Future Direction
-
-Sloflo is moving toward **Service Level Objective (SLO)** integration. This will allow users to define specific latency targets (e.g., p95 < 50ms). The engine will then manage the concurrency limit specifically to stay within those business-defined bounds.
-
 ![Sloflo Performance Profile](./plots/analysis_system_unified_v2.png)
 
 ## License
