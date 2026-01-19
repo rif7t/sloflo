@@ -20,14 +20,6 @@ Sloflo utilizes a gradient-based algorithm to dynamically calculate a safety cei
 4.  **NIC-Level Enforcement:** Decisions are enforced via `XDP_DROP`. Excess packets are rejected before they consume kernel CPU or memory.
 
 ## Analysis & Performance
-
-The effectiveness of the concurrency control can be observed in the system metrics. As seen in the performance graphs, the **Inflight** requests strictly follow the **Concurrency Limit** baseline. 
-
-
-
-When the system observes a decrease in latency (RTT), the algorithm increases the concurrency limit, allowing more inflight packets into the system. Conversely, as latency spikes, the gradient drops, and Sloflo immediately "clenches" the limit to protect the application from bufferbloat and resource exhaustion.
-
-## Analysis & Performance
 In high-load environments, Sloflo demonstrates rapid convergence. Recent performance profiles show the tool scaling from a cold start to a concurrency limit of over **2,500 requests** in milliseconds while maintaining an extremely low overshoot rate (typically <2%). 
 
 The **Inflight** requests strictly follow the **Concurrency Limit** ceiling. When the backend "Drain Rate" slows down, Sloflo instantly closes the gate, allowing the application to clear its backlog before reopening for more traffic.
