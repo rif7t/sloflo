@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 )
@@ -26,12 +28,15 @@ type ControlState struct {
 	ConcurrencyLimit uint32
 	Inflight         uint32
 	LatestRTTNs      uint64
+	WindowMinRTTNs   uint64
+	WindowStartNS    uint64
 }
 
 const (
-	MinConcurrency     = 0
+	MinConcurrency     = 8
 	MaxConcurrency     = 250
-	InitialConcurrency = 0
+	InitialConcurrency = 20
+	RTTWindowNs        = uint64(0.001 * 1e9)
 )
 
 func main() {
@@ -163,29 +168,46 @@ func main() {
 			if err != nil {
 				log.Fatalf("lookup control_state failed: %v", err)
 			}
-			if state.MinRTTNs == 0 || rtt < state.MinRTTNs {
-				state.MinRTTNs = rtt
+			now := uint64(time.Now().UnixNano())
+
+			if state.WindowStartNS == 0 {
+				state.WindowStartNS = now
+				state.WindowMinRTTNs = rtt
 			}
+
+			if now-state.WindowStartNS > RTTWindowNs {
+				state.MinRTTNs = state.WindowMinRTTNs
+				state.WindowStartNS = now
+				state.WindowMinRTTNs = rtt
+			} else {
+				if state.WindowMinRTTNs == 0 || rtt < state.WindowMinRTTNs {
+					state.WindowMinRTTNs = rtt
+				}
+			}
+			state.MinRTTNs = state.WindowMinRTTNs
+			state.LatestRTTNs = rtt
+
 			if state.ConcurrencyLimit <= 0 {
 				state.ConcurrencyLimit = InitialConcurrency
 			}
 
 			gradient := float64(state.MinRTTNs) / float64(rtt)
 
-			state.LatestRTTNs = rtt
-
-			err = objs.ControlMap.Update(&key, &state, 0)
-			if err != nil {
-				log.Fatalf("update control_map failed: %v", err)
-			}
 			var zero uint32
 			var inflight_total uint64
 			err = objs.InflightTotal.Lookup(&zero, &inflight_total)
+
 			if err != nil {
 				log.Fatalf("error reading total inflight: %v", err)
 			}
 
-			state.ConcurrencyLimit = uint32(uint64(float64(state.ConcurrencyLimit)*gradient) + inflight_total)
+			state.Inflight = uint32(inflight_total)
+			state.ConcurrencyLimit = uint32(uint64(float64(state.ConcurrencyLimit)*gradient) + uint64(math.Sqrt(float64(state.ConcurrencyLimit))))
+			err = objs.ControlMap.Update(&key, &state, ebpf.UpdateAny)
+			if err != nil {
+				log.Fatalf("update control_map failed: %v", err)
+			}
+
 			writer.Write([]string{
 				fmt.Sprintf("%d", time.Now().UnixNano()),
 				fmt.Sprintf("%d", rtt),
