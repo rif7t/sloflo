@@ -4,10 +4,6 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
 
-#define TCP_NEW_SYN_RECV 11
-#define TCP_ESTABLISHED 1
-#define TCP_LAST_ACK 8
-#define TCP_CLOSE_WAIT 7
 #define SERVER_PID 278040
 #define TARGET_PORT 8080
 
@@ -16,6 +12,8 @@ struct control_state {
 	u32 concurrency_limit;
 	u32 inflight;
 	u64 latest_rtt_ns;
+    u64 window_min_rtt_ns;
+    u64 window_start_ns;
 };
 
 struct {
@@ -58,42 +56,10 @@ static __always_inline unsigned int tcp_packets_in_flight(const struct tcp_sock 
     return packets_out - tcp_left_out(tp) + retrans_out;
 }
 
-SEC("fentry/tcp_ack")
-int BPF_PROG(fentry_tcp_ack, struct sock *sk, const struct sk_buff * skb, int flag)
-{
-
-    struct tcp_sock *ts = (struct tcp_sock *)(sk);
-    u64 cur = tcp_packets_in_flight(ts);
-    u64 *prev = bpf_map_lookup_elem(&sock_inflight, &sk);
-
-    s32 delta;
-    if (prev) {
-        delta = (s32)cur - (s32)(*prev);
-        *prev = cur;
-    }else {
-        bpf_map_update_elem(&sock_inflight, &sk, &cur, BPF_ANY);
-        delta = cur;
-    }
-    if (delta < 0) {
-        bpf_printk("Delta < 0: %d", delta);
-        u32 zero = 0;
-        u64 *total = bpf_map_lookup_elem(&inflight_total, &zero);
-        u64 oldtotal = *total ;
-        if (total){
-            bpf_printk("Total inflights pre sub: %llu", oldtotal);
-            __sync_fetch_and_sub(total, -delta);
-
-            u64 *newTotal = bpf_map_lookup_elem(&inflight_total, &zero);
-            u64 newtotal = *newTotal;
-            if(newTotal)
-                bpf_printk("Total inflights post sub: %llu", *newTotal);
-        }
-    }
-    return 0;
-}
-
 SEC("fentry/tcp_rcv_established")
 int BPF_PROG(fentry_tcp_rcv_established, struct sock *sk) {
+
+    //manually filter http packets
     u64 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != SERVER_PID){
         return 0;
@@ -144,6 +110,7 @@ int BPF_PROG(fentry_tcp_rcv_established, struct sock *sk) {
 SEC("fentry/tcp_set_state")
 int BPF_PROG(fentry_tcp_set_state, struct sock *sk, int state)
 {
+    //manually filter http server 
     u64 pid = bpf_get_current_pid_tgid() >> 32;
     if (pid != SERVER_PID){
         return 0;
@@ -174,7 +141,6 @@ int BPF_PROG(fentry_tcp_set_state, struct sock *sk, int state)
         else if (delta < 0){
             __sync_fetch_and_sub(total, -delta);
         }
-            
     }
     return 0;
 }
@@ -182,16 +148,22 @@ int BPF_PROG(fentry_tcp_set_state, struct sock *sk, int state)
 
 SEC("xdp")
 int xdp_rate_limiter(struct xdp_md *ctx) {
+      u64 pid = bpf_get_current_pid_tgid() >> 32;
+
+    //manually filter http server packets
+    if (pid != SERVER_PID){
+        return 0;
+    }
     u32 zero = 0;
+    u32 *inflight = bpf_map_lookup_elem(&inflight_total, &zero);
     struct control_state *cs = bpf_map_lookup_elem(&control_map, &zero);
     if (!cs)
         return XDP_PASS;
-    
+
     if (cs->inflight > cs->concurrency_limit) {
         bpf_printk("DROPPED: inflight=%d, limit=%d", cs->inflight, cs->concurrency_limit);
         return XDP_DROP;
     }
-    
     return XDP_PASS;
 }
 
