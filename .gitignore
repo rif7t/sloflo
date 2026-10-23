@@ -26,3 +26,10 @@ bin/
 
 # CSV 
 *.csv
+
+# Built controller binary
+cmd/rlimit/rlimit
+
+# Generated per-run plots and tables (keep only plots/compare_step.png)
+plots/live_*.png
+plots/compare_*.md

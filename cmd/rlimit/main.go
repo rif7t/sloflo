@@ -8,9 +8,9 @@ import (
 	"encoding/binary"
 	"encoding/csv"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"os"
 	"os/signal"
@@ -21,6 +21,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+	"github.com/rif7t/slowflo/internal/control"
 )
 
 type ControlState struct {
@@ -32,17 +33,32 @@ type ControlState struct {
 	WindowStartNS    uint64
 }
 
-const (
-	MinConcurrency     = 8
-	MaxConcurrency     = 250
-	InitialConcurrency = 20
-	RTTWindowNs        = uint64(0.001 * 1e9)
-)
+var observeOnly = flag.Bool("observe-only", false, "skip attaching the XDP packet dropper")
+var ifaceName = flag.String("iface", "", "interface to attach XDP to (default: the default-route interface)")
+var window = flag.Duration("window", 5*time.Second, "how long a minimum latency is trusted before it is forgotten")
+var tick = flag.Duration("tick", 100*time.Millisecond, "control interval: latency samples are averaged and the limit updated once per tick")
+var serverAddr = flag.String("server-addr", "", "only measure/police the server listening on this local IPv4 address (default: any address on the port)")
+var csvPath = flag.String("csv", "rlimit_results.csv", "path for the control-loop CSV trace")
 
 func main() {
-	var objs rlimitObjects
-	err := loadRlimitObjects(&objs, nil)
+	flag.Parse()
+
+	spec, err := loadRlimit()
 	if err != nil {
+		log.Fatalf("failed to load eBPF spec: %v", err)
+	}
+	if *serverAddr != "" {
+		ip := net.ParseIP(*serverAddr).To4()
+		if ip == nil {
+			log.Fatalf("-server-addr %q is not an IPv4 address", *serverAddr)
+		}
+		// skc_rcv_saddr is stored in network byte order
+		if err := spec.Variables["target_addr"].Set(binary.NativeEndian.Uint32(ip)); err != nil {
+			log.Fatalf("set target_addr: %v", err)
+		}
+	}
+	var objs rlimitObjects
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatalf("failed to load eBPF objects: %v", err)
 	}
 	defer objs.Close()
@@ -75,16 +91,18 @@ func main() {
 		}
 	}()
 
-	ifsource, _ := os.Open("/proc/net/route")
-	defer ifsource.Close()
+	ifname := *ifaceName
+	if ifname == "" {
+		ifsource, _ := os.Open("/proc/net/route")
+		defer ifsource.Close()
 
-	scanner := bufio.NewScanner(ifsource)
-	scanner.Scan()
-	var ifname string
-	for scanner.Scan() {
-		fields := strings.Fields(scanner.Text())
-		if fields[1] == "00000000" {
-			ifname = fields[0]
+		scanner := bufio.NewScanner(ifsource)
+		scanner.Scan()
+		for scanner.Scan() {
+			fields := strings.Fields(scanner.Text())
+			if fields[1] == "00000000" {
+				ifname = fields[0]
+			}
 		}
 	}
 	iface, err := net.InterfaceByName(ifname)
@@ -92,15 +110,19 @@ func main() {
 		log.Fatalf("interface not found: %v", err)
 	}
 
-	xdp_rate_limiter_link, err := link.AttachXDP(link.XDPOptions{
-		Program:   objs.XdpRateLimiter,
-		Interface: iface.Index,
-		Flags:     link.XDPGenericMode,
-	})
-	if err != nil {
-		log.Fatalf("failed to attach XDP program: %v", err)
+	if !*observeOnly {
+		xdpRateLimiterLink, err := link.AttachXDP(link.XDPOptions{
+			Program:   objs.XdpRateLimiter,
+			Interface: iface.Index,
+			Flags:     link.XDPGenericMode,
+		})
+		if err != nil {
+			log.Fatalf("failed to attach XDP program: %v", err)
+		}
+		defer xdpRateLimiterLink.Close()
+	} else {
+		fmt.Println("Observe-only mode: XDP packet dropping is disabled")
 	}
-	defer xdp_rate_limiter_link.Close()
 
 	tcp_rcv_established_link, err := link.AttachTracing(link.TracingOptions{
 		Program: objs.FentryTcpRcvEstablished,
@@ -109,6 +131,14 @@ func main() {
 		log.Fatalf("load tcp_rcv_established kprobe: %v", err)
 	}
 	defer tcp_rcv_established_link.Close()
+
+	tcp_sendmsg_link, err := link.AttachTracing(link.TracingOptions{
+		Program: objs.FentryTcpSendmsg,
+	})
+	if err != nil {
+		log.Fatalf("attach tcp_sendmsg fentry: %v", err)
+	}
+	defer tcp_sendmsg_link.Close()
 
 	tcp_set_state_link, err := link.AttachTracing(link.TracingOptions{
 		Program: objs.FentryTcpSetState,
@@ -120,7 +150,7 @@ func main() {
 
 	fmt.Println("Listening for packet events...")
 
-	f, err := os.Create("rlimit_results.csv")
+	f, err := os.Create(*csvPath)
 	if err != nil {
 		log.Fatalf("failed to create results file: %v", err)
 	}
@@ -129,7 +159,10 @@ func main() {
 	writer := csv.NewWriter(f)
 	defer writer.Flush()
 
-	header := []string{"TimeStamp", "LatestRTTNs", "Gradient", "MinRTTNs", "Inflight", "ConcurrencyLimit"}
+	header := []string{
+		"TimeStamp", "LatestRTTNs", "Gradient", "MinRTTNs", "Inflight", "ConcurrencyLimit",
+		"WindowReset", "OldMinRTTNs", "NewMinRTTNs", "OldConcurrencyLimit", "NewConcurrencyLimit", "Samples",
+	}
 	if err := writer.Write(header); err != nil {
 		log.Fatalf("failed to write CSV header: %v", err)
 	}
@@ -138,11 +171,16 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	done := make(chan struct{})
+	startTime := time.Now()
 
 	go func() {
 		<-sigCh
 		close(done)
 	}()
+
+	ticker := time.NewTicker(*tick)
+	defer ticker.Stop()
+	var agg control.Aggregator
 
 	for {
 		select {
@@ -150,13 +188,22 @@ func main() {
 			reader.Close()
 			fmt.Println("Exiting")
 			return
-		case record := <-recordCh:
+		case record, ok := <-recordCh:
+			if !ok {
+				return
+			}
 			var rtt uint64
 			if err := binary.Read(
 				bytes.NewReader(record.RawSample),
 				binary.LittleEndian,
 				&rtt,
 			); err != nil {
+				continue
+			}
+			agg.Add(rtt)
+		case <-ticker.C:
+			rtt, samples, ok := agg.Flush()
+			if !ok {
 				continue
 			}
 			var (
@@ -169,29 +216,19 @@ func main() {
 				log.Fatalf("lookup control_state failed: %v", err)
 			}
 			now := uint64(time.Now().UnixNano())
-
-			if state.WindowStartNS == 0 {
-				state.WindowStartNS = now
-				state.WindowMinRTTNs = rtt
+			cs := control.State{
+				WindowStartNS:    state.WindowStartNS,
+				WindowMinRTTNs:   state.WindowMinRTTNs,
+				MinRTTNs:         state.MinRTTNs,
+				ConcurrencyLimit: state.ConcurrencyLimit,
 			}
-
-			if now-state.WindowStartNS > RTTWindowNs {
-				state.MinRTTNs = state.WindowMinRTTNs
-				state.WindowStartNS = now
-				state.WindowMinRTTNs = rtt
-			} else {
-				if state.WindowMinRTTNs == 0 || rtt < state.WindowMinRTTNs {
-					state.WindowMinRTTNs = rtt
-				}
-			}
-			state.MinRTTNs = state.WindowMinRTTNs
+			res := control.Step(&cs, rtt, now, uint64(window.Nanoseconds()))
+			state.WindowStartNS = cs.WindowStartNS
+			state.WindowMinRTTNs = cs.WindowMinRTTNs
+			state.MinRTTNs = cs.MinRTTNs
 			state.LatestRTTNs = rtt
-
-			if state.ConcurrencyLimit <= 0 {
-				state.ConcurrencyLimit = InitialConcurrency
-			}
-
-			gradient := float64(state.MinRTTNs) / float64(rtt)
+			windowReset, oldMinRTTNs := res.WindowReset, res.OldMinRTTNs
+			oldConcurrencyLimit, gradient := res.OldConcurrencyLimit, res.Gradient
 
 			var zero uint32
 			var inflight_total uint64
@@ -202,7 +239,7 @@ func main() {
 			}
 
 			state.Inflight = uint32(inflight_total)
-			state.ConcurrencyLimit = uint32(uint64(float64(state.ConcurrencyLimit)*gradient) + uint64(math.Sqrt(float64(state.ConcurrencyLimit))))
+			state.ConcurrencyLimit = cs.ConcurrencyLimit
 			err = objs.ControlMap.Update(&key, &state, ebpf.UpdateAny)
 			if err != nil {
 				log.Fatalf("update control_map failed: %v", err)
@@ -215,9 +252,17 @@ func main() {
 				fmt.Sprintf("%d", state.MinRTTNs),
 				fmt.Sprintf("%d", inflight_total),
 				fmt.Sprintf("%d", state.ConcurrencyLimit),
+				fmt.Sprintf("%t", windowReset),
+				fmt.Sprintf("%d", oldMinRTTNs),
+				fmt.Sprintf("%d", state.MinRTTNs),
+				fmt.Sprintf("%d", oldConcurrencyLimit),
+				fmt.Sprintf("%d", state.ConcurrencyLimit),
+				fmt.Sprintf("%d", samples),
 			})
 			writer.Flush()
-			fmt.Printf("LatestRTT: %d ns, Gradient: %.5f, MinRTT: %d, Inflight: %d, New Concurrency Limit: %d\n", rtt, gradient, state.MinRTTNs, inflight_total, state.ConcurrencyLimit)
+			fmt.Printf("Elapsed: %s, WindowReset: %t, Latency: %d ns (%d samples), MinLatency: %d -> %d ns, Gradient: %.5f, Limit: %d -> %d, Inflight: %d\n",
+				time.Since(startTime).Round(time.Millisecond), windowReset, rtt, samples, oldMinRTTNs,
+				state.MinRTTNs, gradient, oldConcurrencyLimit, state.ConcurrencyLimit, inflight_total)
 		}
 	}
 
